@@ -3,14 +3,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Camera, CameraOff, Copy, Download, Eraser, History, Play, Square,
-  Settings2, AlertCircle, Loader2, Delete, Space
+  Settings2, AlertCircle, Loader2, Delete, Space, Undo2, BookOpen,
 } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { recognize, type Landmark } from "@/lib/gesture-recognizer";
+import {
+  recognize, SUPPORTED_LETTERS, SUPPORTED_GESTURES,
+  type Landmark, type Mode, type Recognition,
+} from "@/lib/gesture-recognizer";
 
 export const Route = createFileRoute("/recognize")({
   head: () => ({
@@ -24,7 +27,6 @@ export const Route = createFileRoute("/recognize")({
   component: RecognizePage,
 });
 
-// Hand landmark connections for drawing
 const HAND_CONNECTIONS: [number, number][] = [
   [0,1],[1,2],[2,3],[3,4],
   [0,5],[5,6],[6,7],[7,8],
@@ -34,7 +36,12 @@ const HAND_CONNECTIONS: [number, number][] = [
   [0,17],
 ];
 
-type HistoryItem = { letter: string; confidence: number; at: number };
+type HistoryItem = { label: string; kind: "letter" | "gesture"; confidence: number; at: number; committedText: string };
+
+// Frames a gesture must be stable before it commits (~250ms at 30fps)
+const STABLE_FRAMES = 7;
+// Cooldown after a commit (ms) before the same label can commit again
+const COOLDOWN_MS = 900;
 
 function RecognizePage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -48,17 +55,20 @@ function RecognizePage() {
   const [status, setStatus] = useState<"idle" | "loading-model" | "requesting" | "running" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
   const [handDetected, setHandDetected] = useState(false);
-  const [current, setCurrent] = useState<{ letter: string | null; confidence: number }>({ letter: null, confidence: 0 });
+  const [current, setCurrent] = useState<Recognition>({ label: null, confidence: 0, kind: null });
   const [threshold, setThreshold] = useState(0.7);
+  const [mode, setMode] = useState<Mode>("auto");
   const [text, setText] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
 
-  // Refs for stable letter detection (avoid duplicates)
-  const stableRef = useRef<{ letter: string | null; count: number; committed: string | null }>({
-    letter: null, count: 0, committed: null,
-  });
+  // Refs for temporal smoothing + cooldown
+  const stableRef = useRef<{ label: string | null; count: number }>({ label: null, count: 0 });
+  const lastCommitRef = useRef<{ label: string | null; at: number }>({ label: null, at: 0 });
+
   const thresholdRef = useRef(threshold);
   useEffect(() => { thresholdRef.current = threshold; }, [threshold]);
+  const modeRef = useRef(mode);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
 
   // Enumerate cameras
   useEffect(() => {
@@ -83,6 +93,95 @@ function RecognizePage() {
 
   useEffect(() => () => stopEverything(), [stopEverything]);
 
+  const loop = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const landmarker = landmarkerRef.current;
+    if (!video || !canvas || !landmarker) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const render = () => {
+      if (!video || video.readyState < 2) {
+        rafRef.current = requestAnimationFrame(render);
+        return;
+      }
+      const w = video.videoWidth, h = video.videoHeight;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      ctx.clearRect(0, 0, w, h);
+
+      let results: any;
+      try {
+        results = landmarker.detectForVideo(video, performance.now());
+      } catch {
+        rafRef.current = requestAnimationFrame(render);
+        return;
+      }
+
+      const hand: Landmark[] | undefined = results?.landmarks?.[0];
+      if (hand && hand.length) {
+        setHandDetected(true);
+        ctx.strokeStyle = "rgba(139, 92, 246, 0.9)";
+        ctx.lineWidth = Math.max(2, w * 0.003);
+        ctx.beginPath();
+        for (const [a, b] of HAND_CONNECTIONS) {
+          const pa = hand[a], pb = hand[b];
+          ctx.moveTo(pa.x * w, pa.y * h);
+          ctx.lineTo(pb.x * w, pb.y * h);
+        }
+        ctx.stroke();
+        ctx.fillStyle = "rgba(236, 72, 153, 1)";
+        for (const p of hand) {
+          ctx.beginPath();
+          ctx.arc(p.x * w, p.y * h, Math.max(3, w * 0.005), 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        const rec = recognize(hand, modeRef.current);
+        setCurrent(rec);
+
+        const st = stableRef.current;
+        const now = performance.now();
+        if (rec.label && rec.confidence >= thresholdRef.current) {
+          if (st.label === rec.label) {
+            st.count += 1;
+          } else {
+            st.label = rec.label;
+            st.count = 1;
+          }
+          if (st.count === STABLE_FRAMES) {
+            const last = lastCommitRef.current;
+            const cooled = last.label !== rec.label || now - last.at > COOLDOWN_MS;
+            if (cooled) {
+              lastCommitRef.current = { label: rec.label, at: now };
+              const committed = rec.kind === "letter" ? rec.label : ` ${rec.label} `;
+              const label = rec.label;
+              const confidence = rec.confidence;
+              const kind = rec.kind ?? "gesture";
+              setText((prev) => (prev + committed).replace(/ +/g, " "));
+              setHistory((prev) => [
+                { label, kind, confidence, at: Date.now(), committedText: committed },
+                ...prev,
+              ].slice(0, 100));
+            }
+          }
+        } else {
+          st.label = rec.label;
+          st.count = 0;
+        }
+      } else {
+        setHandDetected(false);
+        setCurrent({ label: null, confidence: 0, kind: null });
+        stableRef.current = { label: null, count: 0 };
+      }
+
+      rafRef.current = requestAnimationFrame(render);
+    };
+    rafRef.current = requestAnimationFrame(render);
+  }, []);
+
   const start = useCallback(async () => {
     setError(null);
     try {
@@ -91,7 +190,6 @@ function RecognizePage() {
         throw new Error("Your browser does not support webcam access.");
       }
 
-      // Load MediaPipe
       setStatus("loading-model");
       const { FilesetResolver, HandLandmarker } = await import("@mediapipe/tasks-vision");
       const vision = await FilesetResolver.forVisionTasks(
@@ -128,10 +226,8 @@ function RecognizePage() {
       });
       await video.play();
 
-      // Refresh cameras list now that we have permissions (labels populate)
       navigator.mediaDevices.enumerateDevices().then((devs) => {
-        const cams = devs.filter((d) => d.kind === "videoinput");
-        setCameras(cams);
+        setCameras(devs.filter((d) => d.kind === "videoinput"));
       });
 
       setStatus("running");
@@ -148,100 +244,13 @@ function RecognizePage() {
       stopEverything();
       toast.error(msg);
     }
-  }, [selectedCam, stopEverything]);
-
-  const loop = useCallback(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const landmarker = landmarkerRef.current;
-    if (!video || !canvas || !landmarker) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const render = () => {
-      if (!video || video.readyState < 2) {
-        rafRef.current = requestAnimationFrame(render);
-        return;
-      }
-      const w = video.videoWidth, h = video.videoHeight;
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
-      ctx.clearRect(0, 0, w, h);
-
-      let results: any;
-      try {
-        results = landmarker.detectForVideo(video, performance.now());
-      } catch (e) {
-        rafRef.current = requestAnimationFrame(render);
-        return;
-      }
-
-      const hand: Landmark[] | undefined = results?.landmarks?.[0];
-      if (hand && hand.length) {
-        setHandDetected(true);
-        // Draw connections
-        ctx.strokeStyle = "rgba(139, 92, 246, 0.9)";
-        ctx.lineWidth = Math.max(2, w * 0.003);
-        ctx.beginPath();
-        for (const [a, b] of HAND_CONNECTIONS) {
-          const pa = hand[a], pb = hand[b];
-          ctx.moveTo(pa.x * w, pa.y * h);
-          ctx.lineTo(pb.x * w, pb.y * h);
-        }
-        ctx.stroke();
-        // Draw points
-        ctx.fillStyle = "rgba(236, 72, 153, 1)";
-        for (const p of hand) {
-          ctx.beginPath();
-          ctx.arc(p.x * w, p.y * h, Math.max(3, w * 0.005), 0, Math.PI * 2);
-          ctx.fill();
-        }
-
-        const rec = recognize(hand);
-        setCurrent(rec);
-
-        // Stable-letter commit logic
-        const st = stableRef.current;
-        if (rec.letter && rec.confidence >= thresholdRef.current) {
-          if (st.letter === rec.letter) {
-            st.count += 1;
-          } else {
-            st.letter = rec.letter;
-            st.count = 1;
-          }
-          // Commit after ~8 stable frames (~0.25s) if different from last committed
-          if (st.count === 8 && st.letter !== st.committed) {
-            st.committed = st.letter;
-            const letter = st.letter;
-            setText((prev) => prev + letter);
-            setHistory((prev) => [{ letter, confidence: rec.confidence, at: Date.now() }, ...prev].slice(0, 50));
-          }
-        } else {
-          // Gesture lost — allow re-commit of same letter later
-          if (st.count > 0 && !rec.letter) {
-            st.committed = null;
-          }
-          st.letter = rec.letter;
-          st.count = 0;
-        }
-      } else {
-        setHandDetected(false);
-        setCurrent({ letter: null, confidence: 0 });
-        const st = stableRef.current;
-        st.letter = null; st.count = 0; st.committed = null;
-      }
-
-      rafRef.current = requestAnimationFrame(render);
-    };
-    rafRef.current = requestAnimationFrame(render);
-  }, []);
+  }, [selectedCam, stopEverything, loop]);
 
   const stop = useCallback(() => {
     stopEverything();
     setStatus("idle");
     setHandDetected(false);
-    setCurrent({ letter: null, confidence: 0 });
+    setCurrent({ label: null, confidence: 0, kind: null });
   }, [stopEverything]);
 
   const running = status === "running";
@@ -263,6 +272,14 @@ function RecognizePage() {
     URL.revokeObjectURL(url);
     toast.success("Downloaded transcript");
   };
+  const onUndo = () => {
+    setHistory((prev) => {
+      if (!prev.length) return prev;
+      const [last, ...rest] = prev;
+      setText((t) => (t.endsWith(last.committedText) ? t.slice(0, -last.committedText.length) : t.slice(0, -1)));
+      return rest;
+    });
+  };
 
   const statusLabel = useMemo(() => {
     switch (status) {
@@ -274,6 +291,9 @@ function RecognizePage() {
     }
   }, [status, handDetected]);
 
+  const displayLabel = current.label ?? (handDetected ? "Gesture Not Recognized" : "—");
+  const belowThreshold = current.label && current.confidence < threshold;
+
   return (
     <div className="min-h-screen">
       <Navbar />
@@ -282,12 +302,10 @@ function RecognizePage() {
           <div>
             <h1 className="font-display text-3xl font-bold sm:text-4xl">Live Recognizer</h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              Show ASL letters A–F to your camera. Hold each sign briefly to add it to the transcript.
+              A–Z alphabet plus common ASL gestures. Hold each sign briefly to add it.
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <StatusBadge status={status} handDetected={handDetected} label={statusLabel} />
-          </div>
+          <StatusBadge status={status} handDetected={handDetected} label={statusLabel} />
         </div>
 
         <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
@@ -339,15 +357,19 @@ function RecognizePage() {
                     <span className={`h-2 w-2 rounded-full ${handDetected ? "bg-success animate-pulse" : "bg-muted-foreground"}`} />
                     <span className="text-xs font-medium">{statusLabel}</span>
                   </div>
-                  <div className="absolute bottom-4 right-4 rounded-2xl bg-background/85 px-4 py-3 backdrop-blur shadow-card min-w-[160px]">
-                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Current gesture</div>
+                  <div className="absolute bottom-4 right-4 rounded-2xl bg-background/85 px-4 py-3 backdrop-blur shadow-card min-w-[180px]">
+                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                      Current {current.kind ?? "gesture"}
+                    </div>
                     <div className="mt-0.5 flex items-baseline gap-2">
-                      <span className="font-display text-4xl font-bold text-gradient">
-                        {current.letter ?? "—"}
+                      <span className={`font-display font-bold ${current.label ? "text-gradient text-3xl" : "text-muted-foreground text-lg"}`}>
+                        {displayLabel}
                       </span>
-                      <span className="text-sm text-muted-foreground">
-                        {current.letter ? `${Math.round(current.confidence * 100)}%` : ""}
-                      </span>
+                      {current.label && (
+                        <span className={`text-sm ${belowThreshold ? "text-destructive" : "text-muted-foreground"}`}>
+                          {Math.round(current.confidence * 100)}%
+                        </span>
+                      )}
                     </div>
                   </div>
                 </>
@@ -365,7 +387,9 @@ function RecognizePage() {
                   {busy ? statusLabel : "Start recognition"}
                 </Button>
               )}
-              <div className="ml-auto text-xs text-muted-foreground">Supported: A · B · C · D · E · F</div>
+              <div className="ml-auto text-xs text-muted-foreground">
+                26 letters · {SUPPORTED_GESTURES.length} gestures
+              </div>
             </div>
 
             {/* Transcript */}
@@ -379,6 +403,9 @@ function RecognizePage() {
                   <Button size="sm" variant="ghost" onClick={() => setText((t) => t.slice(0, -1))} title="Backspace">
                     <Delete className="h-4 w-4" />
                   </Button>
+                  <Button size="sm" variant="ghost" onClick={onUndo} title="Undo last recognition" disabled={!history.length}>
+                    <Undo2 className="h-4 w-4" />
+                  </Button>
                   <Button size="sm" variant="ghost" onClick={() => setText("")} title="Clear">
                     <Eraser className="h-4 w-4" />
                   </Button>
@@ -390,7 +417,7 @@ function RecognizePage() {
                   </Button>
                 </div>
               </div>
-              <div className="min-h-24 rounded-xl border border-border bg-background/60 p-4 font-display text-2xl tracking-wide break-words">
+              <div className="min-h-24 rounded-xl border border-border bg-background/60 p-4 font-display text-2xl tracking-wide break-words whitespace-pre-wrap">
                 {text || <span className="text-muted-foreground text-base font-sans">Recognized text will appear here…</span>}
               </div>
             </div>
@@ -406,6 +433,20 @@ function RecognizePage() {
               </div>
 
               <div className="space-y-5">
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Recognition mode</label>
+                  <Select value={mode} onValueChange={(v) => setMode(v as Mode)}>
+                    <SelectTrigger className="mt-2">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">Auto (letters + gestures)</SelectItem>
+                      <SelectItem value="letters">Letters only (A–Z)</SelectItem>
+                      <SelectItem value="gestures">Gestures only</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
                 <div>
                   <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Camera</label>
                   <Select value={selectedCam} onValueChange={setSelectedCam} disabled={running}>
@@ -449,6 +490,30 @@ function RecognizePage() {
               </div>
             </div>
 
+            {/* Vocabulary */}
+            <div className="rounded-3xl border border-border bg-gradient-card p-6 shadow-card">
+              <div className="mb-3 flex items-center gap-2">
+                <BookOpen className="h-4 w-4 text-primary" />
+                <h2 className="text-lg font-semibold">Vocabulary</h2>
+              </div>
+              <div className="mb-3">
+                <div className="text-xs uppercase tracking-wider text-muted-foreground mb-2">Letters</div>
+                <div className="flex flex-wrap gap-1">
+                  {SUPPORTED_LETTERS.map((l) => (
+                    <span key={l} className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border bg-background/60 text-xs font-mono">{l}</span>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground mb-2">Gestures</div>
+                <div className="flex flex-wrap gap-1">
+                  {SUPPORTED_GESTURES.map((g) => (
+                    <Badge key={g} variant="secondary" className="font-normal">{g}</Badge>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             {/* History */}
             <div className="rounded-3xl border border-border bg-gradient-card p-6 shadow-card">
               <div className="mb-4 flex items-center justify-between">
@@ -467,10 +532,9 @@ function RecognizePage() {
                   {history.map((h, i) => (
                     <li key={i} className="flex items-center justify-between rounded-lg border border-border bg-background/50 px-3 py-2">
                       <div className="flex items-center gap-3">
-                        <span className="font-display text-xl font-bold text-gradient w-6">{h.letter}</span>
-                        <span className="text-xs text-muted-foreground">
-                          {new Date(h.at).toLocaleTimeString()}
-                        </span>
+                        <span className="font-display text-base font-bold text-gradient">{h.label}</span>
+                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{h.kind}</span>
+                        <span className="text-xs text-muted-foreground">{new Date(h.at).toLocaleTimeString()}</span>
                       </div>
                       <Badge variant="secondary">{Math.round(h.confidence * 100)}%</Badge>
                     </li>
